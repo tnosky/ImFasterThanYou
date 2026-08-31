@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Shortest Path Results</title>
+</head>
+<body>
+    <h1>Shortest Path from {{ start }} to {{ end }}</h1>
+
+    {% if path_lines %}
+      <ol>
+        {% for line in path_lines %}
+          <li>{{ line }}</li>
+        {% endfor %}
+      </ol>
+    {% else %}
+      <p>No path found or data missing.</p>
+    {% endif %}
+
+    <p><a href="{{ url_for('index') }}">Back to Home</a></p>
+</body>
+</html>

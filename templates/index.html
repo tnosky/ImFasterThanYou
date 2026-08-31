@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Shortest Path Finder</title>
+</head>
+<body>
+    <h1>Find Shortest Path Between Athletes</h1>
+
+    {% if error %}
+      <p style="color:red;">{{ error }}</p>
+    {% endif %}
+
+    <form method="post" action="/">
+      <label>Start Athlete:</label>
+      <input type="text" name="start_athlete" required><br><br>
+
+      <label>End Athlete:</label>
+      <input type="text" name="end_athlete" required><br><br>
+
+      <label>Sport:</label>
+      <label><input type="radio" name="sport" value="both" checked> Both</label>
+      <label><input type="radio" name="sport" value="xc"> Cross Country</label>
+      <label><input type="radio" name="sport" value="track"> Track &amp; Field</label>
+      <br><br>
+
+      <button type="submit">Find Path</button>
+    </form>
+</body>
+</html>
