@@ -4,6 +4,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import psycopg2
 import requests
 from bs4 import BeautifulSoup, Tag
 
@@ -31,11 +32,17 @@ def make_session():
     return session
 
 
-def fetch_soup(session, url):
-    resp = session.get(url, timeout=20)
-    resp.raise_for_status()
-    time.sleep(REQUEST_DELAY)
-    return BeautifulSoup(resp.text, "html.parser")
+def fetch_soup(session, url, retries=3):
+    for attempt in range(retries):
+        try:
+            resp = session.get(url, timeout=20)
+            resp.raise_for_status()
+            time.sleep(REQUEST_DELAY)
+            return BeautifulSoup(resp.text, "html.parser")
+        except requests.RequestException:
+            if attempt == retries - 1:
+                raise
+            time.sleep(2**attempt)
 
 
 def absolute_url(href):
@@ -47,7 +54,35 @@ def absolute_url(href):
 # ---------------------------------------------------------------------------
 # Meet discovery
 # ---------------------------------------------------------------------------
-def discover_meets(session, conn, start_page=1, end_page=None):
+def save_discovered_page(rows):
+    """Uses a fresh, short-lived connection per page so a multi-hour
+    discovery crawl (~1300 pages) survives a proxy dropping a long-lived
+    connection partway through, retrying a couple times on transient
+    connection errors before giving up."""
+    for attempt in range(3):
+        conn = db.get_conn()
+        try:
+            with conn.cursor() as cur:
+                for tr in rows:
+                    meet = parse_search_row(tr)
+                    if meet:
+                        cur.execute(
+                            "INSERT INTO meets (meet_id, name, date, sport, state, url, scraped) "
+                            "VALUES (%(meet_id)s, %(name)s, %(date)s, %(sport)s, %(state)s, %(url)s, FALSE) "
+                            "ON CONFLICT (meet_id) DO NOTHING",
+                            meet,
+                        )
+            conn.commit()
+            return
+        except psycopg2.OperationalError:
+            if attempt == 2:
+                raise
+            time.sleep(3)
+        finally:
+            conn.close()
+
+
+def discover_meets(session, start_page=1, end_page=None):
     soup = fetch_soup(session, f"{SEARCH_URL}?page={start_page}")
     if end_page is None:
         match = TOTAL_RE.search(soup.get_text())
@@ -62,17 +97,7 @@ def discover_meets(session, conn, start_page=1, end_page=None):
         if not rows:
             break
 
-        with conn.cursor() as cur:
-            for tr in rows:
-                meet = parse_search_row(tr)
-                if meet:
-                    cur.execute(
-                        "INSERT INTO meets (meet_id, name, date, sport, state, url, scraped) "
-                        "VALUES (%(meet_id)s, %(name)s, %(date)s, %(sport)s, %(state)s, %(url)s, FALSE) "
-                        "ON CONFLICT (meet_id) DO NOTHING",
-                        meet,
-                    )
-        conn.commit()
+        save_discovered_page(rows)
         print(f"discovered page {page}/{end_page}")
         page += 1
 
@@ -283,8 +308,19 @@ def resolve_runner_id(cur, athlete_id, name, team):
         return athlete_id
 
     fallback_key = f"{name}|{team}"
+    cur.execute("SELECT runner_id FROM runner_fallback_keys WHERE fallback_key = %s", (fallback_key,))
+    row = cur.fetchone()
+    if row:
+        return row[0]
+
+    # Insert the runners row first since runner_fallback_keys has a foreign
+    # key on it. Under concurrent workers two threads could both reach here
+    # for the same new fallback runner; the ON CONFLICT below lets only one
+    # "win" the fallback_key, leaving the loser's runners row as a harmless,
+    # never-referenced orphan rather than a real duplicate.
     cur.execute("SELECT nextval('runner_fallback_seq')")
     candidate_id = cur.fetchone()[0]
+    cur.execute("INSERT INTO runners (runner_id, name) VALUES (%s, %s)", (candidate_id, name))
     cur.execute(
         "INSERT INTO runner_fallback_keys (fallback_key, runner_id) VALUES (%s, %s) "
         "ON CONFLICT (fallback_key) DO NOTHING RETURNING runner_id",
@@ -292,7 +328,6 @@ def resolve_runner_id(cur, athlete_id, name, team):
     )
     row = cur.fetchone()
     if row:
-        cur.execute("INSERT INTO runners (runner_id, name) VALUES (%s, %s)", (candidate_id, name))
         return candidate_id
     cur.execute("SELECT runner_id FROM runner_fallback_keys WHERE fallback_key = %s", (fallback_key,))
     return cur.fetchone()[0]
@@ -332,13 +367,17 @@ def process_meet(meet_id, sport, url):
         conn.close()
 
 
-def scrape_pending_meets(conn, workers=8, limit=None):
-    with conn.cursor() as cur:
-        query = "SELECT meet_id, sport, url FROM meets WHERE scraped = FALSE ORDER BY meet_id"
-        if limit:
-            query += f" LIMIT {int(limit)}"
-        cur.execute(query)
-        pending = cur.fetchall()
+def scrape_pending_meets(workers=8, limit=None):
+    conn = db.get_conn()
+    try:
+        with conn.cursor() as cur:
+            query = "SELECT meet_id, sport, url FROM meets WHERE scraped = FALSE ORDER BY meet_id"
+            if limit:
+                query += f" LIMIT {int(limit)}"
+            cur.execute(query)
+            pending = cur.fetchall()
+    finally:
+        conn.close()
 
     print(f"{len(pending)} meets pending")
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -363,16 +402,15 @@ def main():
 
     conn = db.get_conn()
     db.init_schema(conn)
+    conn.close()
 
     session = make_session()
 
     if not args.scrape_only:
-        discover_meets(session, conn, start_page=args.start_page, end_page=args.end_page)
+        discover_meets(session, start_page=args.start_page, end_page=args.end_page)
 
     if not args.discover_only:
-        scrape_pending_meets(conn, workers=args.workers, limit=args.limit)
-
-    conn.close()
+        scrape_pending_meets(workers=args.workers, limit=args.limit)
 
 
 if __name__ == "__main__":
