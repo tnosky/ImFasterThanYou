@@ -54,14 +54,25 @@ def absolute_url(href):
 # ---------------------------------------------------------------------------
 # Meet discovery
 # ---------------------------------------------------------------------------
+def get_conn_with_retry(retries=5, base_delay=2):
+    for attempt in range(retries):
+        try:
+            return db.get_conn()
+        except psycopg2.OperationalError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(base_delay * (2**attempt))
+
+
 def save_discovered_page(rows):
     """Uses a fresh, short-lived connection per page so a multi-hour
     discovery crawl (~1300 pages) survives a proxy dropping a long-lived
-    connection partway through, retrying a couple times on transient
-    connection errors before giving up."""
+    connection partway through, retrying on transient connection errors
+    (both at connect time and mid-transaction) before giving up."""
     for attempt in range(3):
-        conn = db.get_conn()
+        conn = None
         try:
+            conn = get_conn_with_retry()
             with conn.cursor() as cur:
                 for tr in rows:
                     meet = parse_search_row(tr)
@@ -79,7 +90,8 @@ def save_discovered_page(rows):
                 raise
             time.sleep(3)
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
 
 def discover_meets(session, start_page=1, end_page=None):
@@ -355,8 +367,9 @@ def scrape_meet(session, meet_id, sport, url):
 
 def process_meet(meet_id, sport, url):
     session = make_session()
-    conn = db.get_conn()
+    conn = None
     try:
+        conn = get_conn_with_retry()
         races = scrape_meet(session, meet_id, sport, url)
         save_races(conn, meet_id, races)
         total_rows = sum(len(r["rows"]) for r in races)
@@ -364,11 +377,12 @@ def process_meet(meet_id, sport, url):
     except Exception as exc:  # noqa: BLE001 - keep the worker pool alive on any single-meet failure
         return meet_id, 0, str(exc)
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def scrape_pending_meets(workers=8, limit=None):
-    conn = db.get_conn()
+    conn = get_conn_with_retry()
     try:
         with conn.cursor() as cur:
             query = "SELECT meet_id, sport, url FROM meets WHERE scraped = FALSE ORDER BY meet_id"
@@ -400,7 +414,7 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Cap number of meets scraped this run.")
     args = parser.parse_args()
 
-    conn = db.get_conn()
+    conn = get_conn_with_retry()
     db.init_schema(conn)
     conn.close()
 
