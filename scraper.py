@@ -13,6 +13,13 @@ import db
 BASE = "https://www.tfrrs.org"
 SEARCH_URL = BASE + "/results_search.html"
 REQUEST_DELAY = 0.2
+BLOCK_THRESHOLD = 8  # consecutive 403s before we assume we're blocked and stop
+
+
+class BlockedError(Exception):
+    """Raised when TFRRS returns 403 — treated as a signal to stop the crawl
+    entirely rather than a per-meet failure, so a block doesn't turn into
+    thousands of wasted requests against a server that's already rejecting us."""
 TIME_RE = re.compile(r"\d{1,2}:\d{2}\.\d{1,2}|\b\d{1,3}\.\d{1,2}\b")
 ATHLETE_ID_RE = re.compile(r"tfrrs\.org/athletes/(\d+)/")
 MEET_ID_RE = re.compile(r"/results/(?:xc/)?(\d+)/")
@@ -34,8 +41,10 @@ def make_session():
 
 def fetch_soup(session, url, retries=3):
     for attempt in range(retries):
+        resp = session.get(url, timeout=20)
+        if resp.status_code == 403:
+            raise BlockedError(f"403 Forbidden for {url}")
         try:
-            resp = session.get(url, timeout=20)
             resp.raise_for_status()
             time.sleep(REQUEST_DELAY)
             return BeautifulSoup(resp.text, "html.parser")
@@ -373,9 +382,11 @@ def process_meet(meet_id, sport, url):
         races = scrape_meet(session, meet_id, sport, url)
         save_races(conn, meet_id, races)
         total_rows = sum(len(r["rows"]) for r in races)
-        return meet_id, total_rows, None
+        return meet_id, total_rows, None, False
+    except BlockedError as exc:
+        return meet_id, 0, str(exc), True
     except Exception as exc:  # noqa: BLE001 - keep the worker pool alive on any single-meet failure
-        return meet_id, 0, str(exc)
+        return meet_id, 0, str(exc), False
     finally:
         if conn is not None:
             conn.close()
@@ -394,14 +405,29 @@ def scrape_pending_meets(workers=8, limit=None):
         conn.close()
 
     print(f"{len(pending)} meets pending")
+    consecutive_blocks = 0
+    blocked = False
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(process_meet, mid, sport, url): mid for mid, sport, url in pending}
         done = 0
         for future in as_completed(futures):
-            meet_id, rows, error = future.result()
+            meet_id, rows, error, was_blocked = future.result()
             done += 1
             status = f"ERROR: {error}" if error else f"{rows} rows"
             print(f"[{done}/{len(pending)}] meet {meet_id}: {status}")
+
+            consecutive_blocks = consecutive_blocks + 1 if was_blocked else 0
+            if consecutive_blocks >= BLOCK_THRESHOLD and not blocked:
+                blocked = True
+                print(
+                    f"Stopping: {consecutive_blocks} consecutive 403s from TFRRS — "
+                    "assuming we're blocked. Cancelling remaining queued work."
+                )
+                pool.shutdown(wait=False, cancel_futures=True)
+                break
+
+    if blocked:
+        raise BlockedError("Scrape halted: TFRRS appears to be blocking this IP (repeated 403s).")
 
 
 def main():
@@ -424,7 +450,11 @@ def main():
         discover_meets(session, start_page=args.start_page, end_page=args.end_page)
 
     if not args.discover_only:
-        scrape_pending_meets(workers=args.workers, limit=args.limit)
+        try:
+            scrape_pending_meets(workers=args.workers, limit=args.limit)
+        except BlockedError as exc:
+            print(f"{exc} Wait a while before retrying, and consider lowering --workers.")
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":
