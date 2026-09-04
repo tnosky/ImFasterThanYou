@@ -438,7 +438,12 @@ def main():
     parser.add_argument("--end-page", type=int, default=None)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--limit", type=int, default=None, help="Cap number of meets scraped this run.")
+    parser.add_argument("--delay", type=float, default=None, help="Seconds to sleep after each HTTP request.")
     args = parser.parse_args()
+
+    if args.delay is not None:
+        global REQUEST_DELAY
+        REQUEST_DELAY = args.delay
 
     conn = get_conn_with_retry()
     db.init_schema(conn)
