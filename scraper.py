@@ -330,13 +330,21 @@ def save_races(conn, meet_id, races):
 
     with conn.cursor() as cur:
         if flat:
-            with_id = {(row["athlete_id"], row["name"]) for _, _, row in flat if row["athlete_id"] is not None}
+            # Keyed on athlete_id alone (not (id, name)) — the same runner
+            # can appear multiple times in one meet (e.g. ran two track
+            # events) with slightly different name formatting scraped from
+            # different pages, and a single ON CONFLICT DO UPDATE statement
+            # errors if its target key repeats across rows.
+            with_id = {}
+            for _, _, row in flat:
+                if row["athlete_id"] is not None:
+                    with_id[row["athlete_id"]] = row["name"]
             if with_id:
                 execute_values(
                     cur,
                     "INSERT INTO runners (runner_id, name) VALUES %s "
                     "ON CONFLICT (runner_id) DO UPDATE SET name = EXCLUDED.name",
-                    list(with_id),
+                    list(with_id.items()),
                 )
 
             # Fallback runners (no athlete_id link) are keyed on name|team.
