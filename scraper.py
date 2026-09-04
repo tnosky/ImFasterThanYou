@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import psycopg2
 import requests
 from bs4 import BeautifulSoup, Tag
+from psycopg2.extras import execute_values
 
 import db
 
@@ -319,51 +320,85 @@ def scrape_track_meet(session, meet_id, meet_url):
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
-def resolve_runner_id(cur, athlete_id, name, team):
-    if athlete_id is not None:
-        cur.execute(
-            "INSERT INTO runners (runner_id, name) VALUES (%s, %s) "
-            "ON CONFLICT (runner_id) DO UPDATE SET name = EXCLUDED.name",
-            (athlete_id, name),
-        )
-        return athlete_id
-
-    fallback_key = f"{name}|{team}"
-    cur.execute("SELECT runner_id FROM runner_fallback_keys WHERE fallback_key = %s", (fallback_key,))
-    row = cur.fetchone()
-    if row:
-        return row[0]
-
-    # Insert the runners row first since runner_fallback_keys has a foreign
-    # key on it. Under concurrent workers two threads could both reach here
-    # for the same new fallback runner; the ON CONFLICT below lets only one
-    # "win" the fallback_key, leaving the loser's runners row as a harmless,
-    # never-referenced orphan rather than a real duplicate.
-    cur.execute("SELECT nextval('runner_fallback_seq')")
-    candidate_id = cur.fetchone()[0]
-    cur.execute("INSERT INTO runners (runner_id, name) VALUES (%s, %s)", (candidate_id, name))
-    cur.execute(
-        "INSERT INTO runner_fallback_keys (fallback_key, runner_id) VALUES (%s, %s) "
-        "ON CONFLICT (fallback_key) DO NOTHING RETURNING runner_id",
-        (fallback_key, candidate_id),
-    )
-    row = cur.fetchone()
-    if row:
-        return candidate_id
-    cur.execute("SELECT runner_id FROM runner_fallback_keys WHERE fallback_key = %s", (fallback_key,))
-    return cur.fetchone()[0]
-
-
 def save_races(conn, meet_id, races):
+    """Batches all of a meet's rows into a handful of round-trips instead of
+    one per row. A big invitational can have 1000+ finishers, and at one
+    round-trip per row that was the actual bottleneck in the crawl (not
+    concurrency or request pacing) — each remote round-trip to Railway's
+    Postgres costs tens of ms, so a 1876-row meet meant 1876+ round-trips."""
+    flat = [(race["event"], race["gender"], row) for race in races for row in race["rows"]]
+
     with conn.cursor() as cur:
-        for race in races:
-            for row in race["rows"]:
-                runner_id = resolve_runner_id(cur, row["athlete_id"], row["name"], row["team"])
-                cur.execute(
-                    "INSERT INTO results (meet_id, event, gender, place, runner_id, team, time) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (meet_id, race["event"], race["gender"], row["place"], runner_id, row["team"], row["time"]),
+        if flat:
+            with_id = {(row["athlete_id"], row["name"]) for _, _, row in flat if row["athlete_id"] is not None}
+            if with_id:
+                execute_values(
+                    cur,
+                    "INSERT INTO runners (runner_id, name) VALUES %s "
+                    "ON CONFLICT (runner_id) DO UPDATE SET name = EXCLUDED.name",
+                    list(with_id),
                 )
+
+            # Fallback runners (no athlete_id link) are keyed on name|team.
+            # Resolve existing ones in bulk, then allocate+insert only the
+            # truly new ones, also in bulk.
+            fallback_keys = {}
+            for _, _, row in flat:
+                if row["athlete_id"] is None:
+                    fallback_keys.setdefault(f'{row["name"]}|{row["team"]}', row["name"])
+
+            resolved = {}
+            if fallback_keys:
+                keys = list(fallback_keys)
+                cur.execute(
+                    "SELECT fallback_key, runner_id FROM runner_fallback_keys WHERE fallback_key = ANY(%s)",
+                    (keys,),
+                )
+                resolved.update(cur.fetchall())
+
+                new_keys = [k for k in keys if k not in resolved]
+                if new_keys:
+                    cur.execute("SELECT nextval('runner_fallback_seq') FROM generate_series(1, %s)", (len(new_keys),))
+                    new_ids = [r[0] for r in cur.fetchall()]
+                    execute_values(
+                        cur,
+                        "INSERT INTO runners (runner_id, name) VALUES %s",
+                        [(nid, fallback_keys[k]) for nid, k in zip(new_ids, new_keys)],
+                    )
+                    execute_values(
+                        cur,
+                        "INSERT INTO runner_fallback_keys (fallback_key, runner_id) VALUES %s "
+                        "ON CONFLICT (fallback_key) DO NOTHING",
+                        [(k, nid) for nid, k in zip(new_ids, new_keys)],
+                    )
+                    # A concurrent worker may have won some of these fallback
+                    # keys first; re-fetch the authoritative mapping rather
+                    # than assume our own candidate ids all stuck.
+                    cur.execute(
+                        "SELECT fallback_key, runner_id FROM runner_fallback_keys WHERE fallback_key = ANY(%s)",
+                        (new_keys,),
+                    )
+                    resolved.update(cur.fetchall())
+
+            result_rows = [
+                (
+                    meet_id,
+                    event,
+                    gender,
+                    row["place"],
+                    row["athlete_id"] if row["athlete_id"] is not None else resolved[f'{row["name"]}|{row["team"]}'],
+                    row["team"],
+                    row["time"],
+                )
+                for event, gender, row in flat
+            ]
+            execute_values(
+                cur,
+                "INSERT INTO results (meet_id, event, gender, place, runner_id, team, time) VALUES %s",
+                result_rows,
+                page_size=1000,
+            )
+
         cur.execute("UPDATE meets SET scraped = TRUE WHERE meet_id = %s", (meet_id,))
     conn.commit()
 
