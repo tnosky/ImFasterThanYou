@@ -2,7 +2,7 @@
 
 Find the chain of race wins that connects any two collegiate runners.
 
-Pick two runners and the site finds the shortest path between them where every link is a win: A beat B at one meet, B beat C at another, and so on until it reaches the second runner. It's "My Team Is Better Than Yours" for TFRRS results.
+Pick two runners and the site finds the shortest path between them where every link is a win: A beat B at one meet, B beat C at another, and so on until it reaches the second runner. Inspired by https://myteamisbetterthanyourteam.com/ but for collegiate track and cross country results.
 
 Race data comes from [tfrrs.org](https://www.tfrrs.org), which covers collegiate cross country and track & field. Trent Nosky.
 
@@ -12,7 +12,7 @@ Race data comes from [tfrrs.org](https://www.tfrrs.org), which covers collegiate
 2. **Store.** Results go into Postgres as `(meet, event, gender, place, runner)` rows. Runners are keyed on their TFRRS athlete ID.
 3. **Search.** A win means finishing ahead of someone in the same race, so it's derived at query time with a self-join instead of stored as an edge. The Flask app runs a breadth-first search over that, optionally limited to XC or track.
 
-The first version stored one edge per pair of finishers. A 200-person race is about 20,000 edges, and a partial dataset already came to over 3 GB. Storing placings instead keeps the full dataset in the low millions of rows.
+The first version stored one edge per pair of finishers. A 200 person race is about 20,000 edges, and a partial dataset already came to over 3 GB. Storing placings instead keeps the full dataset in the low millions of rows.
 
 ## Repo layout
 
@@ -56,14 +56,6 @@ For deployment, Railway runs `gunicorn app:app` from the Procfile. Set `DATABASE
 ## Status
 
 Works end to end, but only partly populated.
-
-| | |
-|---|---|
-| Meets discovered | 36,619 |
-| XC meets scraped | 6,917 of 11,263 |
-| Track meets scraped | 655 of 25,356 |
-| Result rows | 1.65M |
-| Runners | 383K |
 
 Scraping is paused. TFRRS rate limits the crawler, and the blocks came sooner each time: about 4,600 meets before the first one, about 75 before the fourth. Meets are scraped in ID order, so what's there skews toward older XC. Track has barely started. A path only exists through meets that have been scraped, so many runner pairs won't connect yet.
 
