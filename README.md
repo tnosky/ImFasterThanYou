@@ -4,11 +4,11 @@ Find the chain of race wins that connects any two collegiate runners.
 
 Pick two runners and the site finds the shortest path between them where every link is a win: A beat B at one meet, B beat C at another, and so on until it reaches the second runner. Inspired by https://myteamisbetterthanyourteam.com/ but for collegiate track and cross country results.
 
-Race data comes from [tfrrs.org](https://www.tfrrs.org), which covers collegiate cross country and track & field. Trent Nosky.
+Race data comes from [tfrrs.org](https://www.tfrrs.org), which covers collegiate cross country and track & field.
 
 ## How it works
 
-1. **Scrape.** `scraper.py` pages through the TFRRS meet search to find every meet, then fetches each one. XC meets have all their results on one page. Track meets have one page per event.
+1. **Scrape.** `scraper.py` pages through the TFRRS meet search to find meets, then fetches each one. XC meets have all results on one page; track meets have multi-event tables or gender subpages.
 2. **Store.** Results go into Postgres as `(meet, event, gender, place, runner)` rows. Runners are keyed on their TFRRS athlete ID.
 3. **Search.** A win means finishing ahead of someone in the same race, so it's derived at query time with a self-join instead of stored as an edge. The Flask app runs a breadth-first search over that, optionally limited to XC or track.
 
@@ -41,9 +41,11 @@ The schema is created on first run.
 python scraper.py
 ```
 
-Discovers every meet, then scrapes them. It's safe to stop and rerun, since a meet is only marked done after its rows commit. Flags: `--discover-only`, `--scrape-only`, `--workers N`, `--delay SECONDS`, `--limit N`.
+Discovers meets, then scrapes them. It's safe to stop and rerun, since a meet is only marked done after its rows commit. Flags: `--discover-only`, `--scrape-only`, `--sport (xc|track|both)`, `--since-year YYYY`, `--start-page N`, `--end-page N`, `--workers N` (default 1), `--delay SECONDS` (default 2), `--limit N`.
 
-If TFRRS returns 8 straight 403s the scraper stops itself. Wait a while, then rerun with fewer workers or a longer delay.
+Requests are slow on purpose (one worker, about 2 s apart), because faster settings got the crawler blocked. 403s, 429s and network errors are retried with backoff. If 8 meets in a row still get 403s after their retries, the scraper stops itself. Wait a while before rerunning.
+
+`python check_scraper.py` runs an offline check of the parsing and retry logic.
 
 **3. Run the site**
 

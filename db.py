@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS results (
 CREATE INDEX IF NOT EXISTS idx_results_race ON results (meet_id, event, gender);
 CREATE INDEX IF NOT EXISTS idx_results_runner ON results (runner_id);
 CREATE INDEX IF NOT EXISTS idx_runners_name ON runners (name);
+CREATE INDEX IF NOT EXISTS idx_meets_pending ON meets (sport, meet_id) WHERE scraped = FALSE;
 """
 
 
