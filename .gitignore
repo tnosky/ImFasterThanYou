@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 all_individual_results.csv
+.idea/
+

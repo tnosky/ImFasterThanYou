@@ -1,8 +1,8 @@
 import argparse
-import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin, urlparse
 
 import psycopg2
 import requests
@@ -12,8 +12,9 @@ from psycopg2.extras import execute_values
 import db
 
 BASE = "https://www.tfrrs.org"
-SEARCH_URL = BASE + "/results_search.html"
-REQUEST_DELAY = 0.2
+SEARCH_URL = BASE + "/results_search_page.html"
+REQUEST_DELAY = 2.0
+PAGE_DELAY = 2.5  # between discovery pages
 BLOCK_THRESHOLD = 8  # consecutive 403s before we assume we're blocked and stop
 
 
@@ -22,11 +23,13 @@ class BlockedError(Exception):
     entirely rather than a per-meet failure, so a block doesn't turn into
     thousands of wasted requests against a server that's already rejecting us."""
 TIME_RE = re.compile(r"\d{1,2}:\d{2}\.\d{1,2}|\b\d{1,3}\.\d{1,2}\b")
-ATHLETE_ID_RE = re.compile(r"tfrrs\.org/athletes/(\d+)/")
+DIGITS_RE = re.compile(r"^\d+")
+MARK_RE = re.compile(r"^\d+(?:\.\d+)?m?$")
+ATHLETE_ID_RE = re.compile(r"/athletes/(\d+)")  # matches relative and absolute hrefs
 MEET_ID_RE = re.compile(r"/results/(?:xc/)?(\d+)/")
-EVENT_LINK_RE_TEMPLATE = r"/results/{meet_id}/(\d+)/"
-GENDER_RE = re.compile(r"/(Mens|Womens)-", re.IGNORECASE)
-TOTAL_RE = re.compile(r"of\s+([\d,]+)\s+in total", re.IGNORECASE)
+XC_MEET_ID_RE = re.compile(r"/results/xc/(\d+)/")
+YEAR_RE = re.compile(r"\b\d{1,2}/\d{1,2}/(\d{4}|\d{2})\b|\b((?:19|20)\d{2})\b")
+HEADING_CLASSES = {"custom-table-title", "custom-title", "race-title"}
 
 
 def make_session():
@@ -41,24 +44,37 @@ def make_session():
 
 
 def fetch_soup(session, url, retries=3):
-    for attempt in range(retries):
-        resp = session.get(url, timeout=20)
-        if resp.status_code == 403:
-            raise BlockedError(f"403 Forbidden for {url}")
+    """Retries network errors and 403/429/5xx with backoff (4s x attempt on
+    403/429, honoring Retry-After) before giving up. Only a 403 that survives
+    every retry counts as a block."""
+    for attempt in range(1, retries + 1):
         try:
-            resp.raise_for_status()
+            resp = session.get(url, timeout=20)
+        except requests.RequestException:
+            if attempt == retries:
+                raise
+            time.sleep(1.5 * attempt)
+            continue
+        if resp.ok:
             time.sleep(REQUEST_DELAY)
             return BeautifulSoup(resp.text, "html.parser")
-        except requests.RequestException:
-            if attempt == retries - 1:
-                raise
-            time.sleep(2**attempt)
+        if attempt == retries:
+            if resp.status_code == 403:
+                raise BlockedError(f"403 Forbidden for {url}")
+            resp.raise_for_status()
+        if resp.status_code < 500 and resp.status_code not in (403, 429):
+            resp.raise_for_status()  # 404 etc. won't fix themselves
+        retry_after = resp.headers.get("Retry-After", "")
+        time.sleep(min(int(retry_after), 60) if retry_after.isdigit() else 4 * attempt)
 
 
 def absolute_url(href):
-    if href.startswith("http"):
-        return href
-    return BASE + href
+    """Resolves href against TFRRS; None if it points off-host."""
+    url = urljoin(BASE + "/", href.strip())
+    parsed = urlparse(url)
+    if parsed.scheme in ("http", "https") and parsed.netloc in ("www.tfrrs.org", "tfrrs.org"):
+        return url
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -74,25 +90,25 @@ def get_conn_with_retry(retries=5, base_delay=2):
             time.sleep(base_delay * (2**attempt))
 
 
-def save_discovered_page(rows):
+def save_discovered_page(meets):
     """Uses a fresh, short-lived connection per page so a multi-hour
     discovery crawl (~1300 pages) survives a proxy dropping a long-lived
     connection partway through, retrying on transient connection errors
     (both at connect time and mid-transaction) before giving up."""
+    if not meets:
+        return
+    meet_rows = [(m["meet_id"], m["name"], m["date"], m["sport"], m["state"], m["url"], False) for m in meets]
     for attempt in range(3):
         conn = None
         try:
             conn = get_conn_with_retry()
             with conn.cursor() as cur:
-                for tr in rows:
-                    meet = parse_search_row(tr)
-                    if meet:
-                        cur.execute(
-                            "INSERT INTO meets (meet_id, name, date, sport, state, url, scraped) "
-                            "VALUES (%(meet_id)s, %(name)s, %(date)s, %(sport)s, %(state)s, %(url)s, FALSE) "
-                            "ON CONFLICT (meet_id) DO NOTHING",
-                            meet,
-                        )
+                execute_values(
+                    cur,
+                    "INSERT INTO meets (meet_id, name, date, sport, state, url, scraped) VALUES %s "
+                    "ON CONFLICT (meet_id) DO NOTHING",
+                    meet_rows,
+                )
             conn.commit()
             return
         except psycopg2.OperationalError:
@@ -104,59 +120,94 @@ def save_discovered_page(rows):
                 conn.close()
 
 
-def discover_meets(session, start_page=1, end_page=None):
-    soup = fetch_soup(session, f"{SEARCH_URL}?page={start_page}")
-    if end_page is None:
-        match = TOTAL_RE.search(soup.get_text())
-        total = int(match.group(1).replace(",", "")) if match else 0
-        end_page = math.ceil(total / 30) if total else start_page
-
-    page = start_page
-    while page <= end_page:
-        if page != start_page:
-            soup = fetch_soup(session, f"{SEARCH_URL}?page={page}")
-        rows = soup.select("table tbody tr")
-        if not rows:
-            break
-
-        save_discovered_page(rows)
-        print(f"discovered page {page}/{end_page}")
-        page += 1
+def meet_year(date_text):
+    """Last year mentioned in a TFRRS date cell ("10/12/2024", "Oct 11-12, 2024",
+    "10/12/24"), or None."""
+    year = None
+    for m in YEAR_RE.finditer(date_text):
+        y = m.group(1) or m.group(2)
+        year = 2000 + int(y) if len(y) == 2 else int(y)
+    return year
 
 
-def parse_search_row(tr):
+def discover_meets(session, start_page=1, end_page=None, since_year=None, sport="xc"):
+    """Pages through search results until an empty page (or end_page).
+    sport can be 'xc', 'track', or 'both'.
+    With since_year, stops once >=80% of a page's meets predate it — search
+    results aren't strictly date-ordered, so one old meet isn't enough."""
+    sports_to_query = ["xc"] if sport == "xc" else (["track"] if sport == "track" else ["xc", "track"])
+    for current_sport in sports_to_query:
+        # TFRRS search parameter for xc is with_sports=xc, and for track is with_sports=track
+        search_query = f"{SEARCH_URL}?with_sports={current_sport}"
+        page = start_page
+        seen_ids = set()
+        while end_page is None or page <= end_page:
+            if page != start_page:
+                time.sleep(PAGE_DELAY)
+            soup = fetch_soup(session, f"{search_query}&page={page}")
+            meets = [m for m in (parse_search_row(tr, default_sport=current_sport) for tr in soup.select("tbody tr")) if m]
+            if not meets:
+                break
+            page_ids = {m["meet_id"] for m in meets}
+            if page_ids <= seen_ids:  # server clamps out-of-range pages to the last one
+                break
+            seen_ids |= page_ids
+
+            if since_year:
+                years = [meet_year(m["date"]) for m in meets]
+                old = sum(1 for y in years if y is not None and y < since_year)
+                meets = [m for m, y in zip(meets, years) if y is None or y >= since_year]
+                save_discovered_page(meets)
+                if old >= 0.8 * len(years):
+                    print(f"[{current_sport}] page {page}: mostly meets before {since_year}, stopping discovery")
+                    break
+            else:
+                save_discovered_page(meets)
+            print(f"[{current_sport}] discovered page {page}" + (f"/{end_page}" if end_page else ""))
+            page += 1
+
+
+def parse_search_row(tr, default_sport=None):
     tds = tr.find_all("td")
-    if len(tds) < 4:
+    if len(tds) < 2:
         return None
-    link = tds[1].find("a")
-    if not link or not link.get("href"):
+    link = tds[1].find("a", href=True)
+    if not link:
         return None
-    href = link["href"]
+    href = link["href"].strip()
     id_match = MEET_ID_RE.search(href)
-    if not id_match:
+    url = absolute_url(href)
+    if not id_match or not url:
         return None
 
-    sport_text = tds[2].get_text(strip=True)
+    # Derive sport from URL structure (/results/xc/ vs /results/), falling back to default_sport
+    is_xc = "/results/xc/" in href
+    sport = "xc" if is_xc else (default_sport if default_sport else "track")
+
     return {
         "meet_id": int(id_match.group(1)),
         "name": link.get_text(strip=True),
         "date": tds[0].get_text(strip=True),
-        "sport": "xc" if "cross country" in sport_text.lower() else "track",
-        "state": tds[3].get_text(strip=True),
-        "url": absolute_url(href),
+        "sport": sport,
+        "state": tds[3].get_text(strip=True) if len(tds) > 3 else None,
+        "url": url,
     }
 
 
 # ---------------------------------------------------------------------------
-# Row / runner parsing shared by XC and track tables
+# Row / runner parsing for XC results tables
 # ---------------------------------------------------------------------------
 def header_indices(table):
+    """Reads <thead> if present, else the first row (th or td cells).
+    place+name are required; team is optional. Supports TIME as well as field
+    event performance marks (MARK, METRIC, RESULT)."""
     thead = table.find("thead")
-    if not thead:
+    header_row = thead if thead else table.find("tr")
+    if header_row is None:
         return None
     idx = {}
     time_indices = []
-    for i, th in enumerate(thead.find_all("th")):
+    for i, th in enumerate(header_row.find_all(["th", "td"])):
         text = th.get_text(strip=True).upper()
         if text.startswith("PL"):
             idx.setdefault("place", i)
@@ -164,33 +215,32 @@ def header_indices(table):
             idx.setdefault("name", i)
         elif text == "TEAM":
             idx.setdefault("team", i)
-        elif text == "TIME":
+        elif text in ("TIME", "MARK", "RESULT", "METRIC"):
             time_indices.append(i)
-    if {"place", "name", "team"} <= idx.keys():
+    if {"place", "name"} <= idx.keys():
         idx["time_indices"] = time_indices
         return idx
     return None
 
 
-def parse_result_rows(table):
-    idx = header_indices(table)
+def parse_result_rows(table, idx=None):
+    idx = idx or header_indices(table)
     if idx is None:
         return []
     tbody = table.find("tbody")
-    if not tbody:
-        return []
+    body_rows = tbody.find_all("tr") if tbody else table.find_all("tr")[1:]
 
     time_indices = idx["time_indices"]
-    max_idx = max([idx["place"], idx["name"], idx["team"]] + time_indices)
+    max_idx = max([idx["place"], idx["name"], idx.get("team", 0)] + time_indices)
 
     rows = []
-    for tr in tbody.find_all("tr"):
+    for tr in body_rows:
         tds = tr.find_all("td")
         if len(tds) <= max_idx:
             continue
 
         place_text = tds[idx["place"]].get_text(strip=True)
-        place_match = re.match(r"\d+", place_text)
+        place_match = DIGITS_RE.match(place_text)
         if not place_match:
             continue
 
@@ -205,18 +255,18 @@ def parse_result_rows(table):
         if not name:
             continue
 
-        team = tds[idx["team"]].get_text(strip=True)
+        team = tds[idx["team"]].get_text(strip=True) if "team" in idx else ""
 
-        # Championship meets report one "TIME"-labeled column per round
-        # (prelim/semi/final) with no reliable ordering as to which is the
-        # final result (verified against live data: sometimes first,
-        # sometimes last). Rather than guess and risk a wildly wrong time,
-        # only record it when the header names exactly one TIME column.
+        # When multiple TIME or MARK columns appear (e.g. split columns, multiple attempts, or finals vs prelims),
+        # take the first valid performance value. If single column, accept standard time/mark.
         row_time = None
-        if len(time_indices) == 1:
-            text = tds[time_indices[0]].get_text(strip=True)
-            if TIME_RE.fullmatch(text):
-                row_time = text
+        if time_indices:
+            for t_col in time_indices:
+                if t_col < len(tds):
+                    text = tds[t_col].get_text(strip=True)
+                    if TIME_RE.fullmatch(text) or MARK_RE.match(text) or "'" in text:
+                        row_time = text
+                        break
 
         rows.append(
             {
@@ -231,20 +281,15 @@ def parse_result_rows(table):
 
 
 def heading_for_table(table):
-    el = table
-    for _ in range(6):
-        if el is None:
-            break
-        sib = el.previous_sibling
-        while sib is not None:
-            if isinstance(sib, Tag):
-                if sib.name == "h3":
-                    return sib.get_text(strip=True)
-                h3 = sib.find("h3")
-                if h3:
-                    return h3.get_text(strip=True)
-            sib = sib.previous_sibling
-        el = el.parent
+    """Closest heading before the table in document order; None if another
+    table comes first (that heading belongs to the earlier table)."""
+    for prev in table.previous_elements:
+        if isinstance(prev, Tag):
+            if prev.name == "table":
+                return None
+            classes = prev.get("class")
+            if prev.name == "h3" or (classes and not HEADING_CLASSES.isdisjoint(classes)):
+                return prev.get_text(strip=True)
     return None
 
 
@@ -255,14 +300,20 @@ def scrape_xc_meet(session, meet_url):
     soup = fetch_soup(session, meet_url)
     races = []
     for table in soup.find_all("table"):
+        # Individual tables have a column named exactly TIME; team-score
+        # tables only have "Total Time"/"Avg Time".
+        # Avoids depending on heading wording like "Individual Results".
+        idx = header_indices(table)
+        if idx is None or not idx["time_indices"]:
+            continue
         heading = heading_for_table(table)
-        if not heading or "individual results" not in heading.lower():
+        if not heading:
             continue
 
         lower = heading.lower()
-        if lower.startswith("women"):
+        if re.search(r"\bwomen", lower):
             gender = "Women"
-        elif lower.startswith("men"):
+        elif re.search(r"\bmen", lower):
             gender = "Men"
         else:
             gender = "Unknown"
@@ -270,50 +321,74 @@ def scrape_xc_meet(session, meet_url):
         distance_match = re.search(r"\(([^)]+)\)", heading)
         event = distance_match.group(1) if distance_match else "XC"
 
-        rows = parse_result_rows(table)
+        rows = parse_result_rows(table, idx)
         if rows:
             races.append({"event": event, "gender": gender, "rows": rows})
     return races
 
 
 # ---------------------------------------------------------------------------
-# Track meets: meet page links out to one results page per event
+# Track meets: multi-event tables on meet page
 # ---------------------------------------------------------------------------
-def scrape_track_meet(session, meet_id, meet_url):
-    soup = fetch_soup(session, meet_url)
-    event_link_re = re.compile(EVENT_LINK_RE_TEMPLATE.format(meet_id=meet_id))
+def normalize_track_event_heading(heading):
+    """Parses track meet table heading into (event_name, gender).
+    Extracts gender, isolates rounds (Prelims, Semis, Finals), skips relays.
+    Returns (None, None) if heading represents a relay or non-individual event."""
+    lower = heading.lower()
+    if "relay" in lower or "4x" in lower or "4 x " in lower or "dmr" in lower:
+        return None, None
 
-    seen_hrefs = set()
-    events = []
-    for link in soup.find_all("a", href=True):
-        href = link["href"]
-        if href in seen_hrefs or not event_link_re.search(href):
-            continue
-        gender_match = GENDER_RE.search(href)
-        if not gender_match:
-            continue
-        seen_hrefs.add(href)
-        events.append(
-            {
-                "url": absolute_url(href),
-                "gender": "Men" if gender_match.group(1).lower() == "mens" else "Women",
-                "event": link.get_text(strip=True),
-            }
-        )
+    if re.search(r"\bwomen", lower):
+        gender = "Women"
+    elif re.search(r"\bmen", lower):
+        gender = "Men"
+    else:
+        gender = "Unknown"
+
+    clean = re.sub(r"^(?:men's|women's|mens|womens|men|women)\s+", "", heading, flags=re.IGNORECASE).strip()
+    return clean, gender
+
+
+def scrape_track_meet(session, meet_url):
+    """Scrapes individual events from a track meet. On TFRRS, track meet landing pages
+    often act as an index containing links to gender subpages (/m/ and /f/), or host
+    event tables directly."""
+    soup = fetch_soup(session, meet_url)
+    target_urls = [meet_url]
+
+    # Look for Men's / Women's subpage links
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if re.search(r"/results/\d+/[mf]/", href):
+            sub_url = absolute_url(href)
+            if sub_url and sub_url not in target_urls:
+                target_urls.append(sub_url)
+
+    # If subpages are found, parse the subpages directly
+    urls_to_parse = target_urls[1:] if len(target_urls) > 1 else target_urls
 
     races = []
-    for ev in events:
-        try:
-            event_soup = fetch_soup(session, ev["url"])
-        except requests.RequestException as exc:
-            print(f"  failed to fetch event {ev['url']}: {exc}")
-            continue
-        table = event_soup.find("table")
-        if table is None:
-            continue
-        rows = parse_result_rows(table)
-        if rows:
-            races.append({"event": ev["event"], "gender": ev["gender"], "rows": rows})
+    for page_url in urls_to_parse:
+        page_soup = soup if page_url == meet_url else fetch_soup(session, page_url)
+        for table in page_soup.find_all("table"):
+            idx = header_indices(table)
+            if idx is None or not idx["time_indices"]:
+                continue
+            heading = heading_for_table(table)
+            if not heading:
+                continue
+
+            event, gender = normalize_track_event_heading(heading)
+            if not event:
+                continue
+
+            # Skip individual section/heat/flight sub-tables when an overall compiled table exists
+            if re.search(r"\b(section|flight|heat)\s+\d+", heading, re.IGNORECASE):
+                continue
+
+            rows = parse_result_rows(table, idx)
+            if rows:
+                races.append({"event": event, "gender": gender, "rows": rows})
     return races
 
 
@@ -343,8 +418,9 @@ def save_races(conn, meet_id, races):
                 execute_values(
                     cur,
                     "INSERT INTO runners (runner_id, name) VALUES %s "
-                    "ON CONFLICT (runner_id) DO UPDATE SET name = EXCLUDED.name",
-                    list(with_id.items()),
+                    "ON CONFLICT (runner_id) DO UPDATE SET name = EXCLUDED.name "
+                    "WHERE runners.name IS DISTINCT FROM EXCLUDED.name",
+                    sorted(with_id.items()),  # fixed lock order: no deadlocks between workers
                 )
 
             # Fallback runners (no athlete_id link) are keyed on name|team.
@@ -364,7 +440,7 @@ def save_races(conn, meet_id, races):
                 )
                 resolved.update(cur.fetchall())
 
-                new_keys = [k for k in keys if k not in resolved]
+                new_keys = sorted(k for k in keys if k not in resolved)
                 if new_keys:
                     cur.execute("SELECT nextval('runner_fallback_seq') FROM generate_series(1, %s)", (len(new_keys),))
                     new_ids = [r[0] for r in cur.fetchall()]
@@ -406,43 +482,45 @@ def save_races(conn, meet_id, races):
                 result_rows,
                 page_size=1000,
             )
-
-        cur.execute("UPDATE meets SET scraped = TRUE WHERE meet_id = %s", (meet_id,))
+            # A meet with 0 parsed rows stays unscraped so a parser miss can't
+            # silently abandon it. Costs one refetch per run for genuinely empty
+            # meets.
+            cur.execute("UPDATE meets SET scraped = TRUE WHERE meet_id = %s", (meet_id,))
     conn.commit()
 
 
-def scrape_meet(session, meet_id, sport, url):
-    if sport == "xc":
-        return scrape_xc_meet(session, url)
-    return scrape_track_meet(session, meet_id, url)
-
-
-def process_meet(meet_id, sport, url):
-    session = make_session()
+def process_meet(meet_id, url, sport="xc"):
     conn = None
-    try:
-        conn = get_conn_with_retry()
-        races = scrape_meet(session, meet_id, sport, url)
-        save_races(conn, meet_id, races)
-        total_rows = sum(len(r["rows"]) for r in races)
-        return meet_id, total_rows, None, False
-    except BlockedError as exc:
-        return meet_id, 0, str(exc), True
-    except Exception as exc:  # noqa: BLE001 - keep the worker pool alive on any single-meet failure
-        return meet_id, 0, str(exc), False
-    finally:
-        if conn is not None:
-            conn.close()
+    with make_session() as session:
+        try:
+            races = scrape_track_meet(session, url) if sport == "track" else scrape_xc_meet(session, url)
+            conn = get_conn_with_retry()  # only after the fetch, so it isn't held idle through HTTP waits
+            save_races(conn, meet_id, races)
+            total_rows = sum(len(r["rows"]) for r in races)
+            return meet_id, total_rows, None, False
+        except BlockedError as exc:
+            return meet_id, 0, str(exc), True
+        except Exception as exc:  # noqa: BLE001 - keep the worker pool alive on any single-meet failure
+            return meet_id, 0, str(exc), False
+        finally:
+            if conn is not None:
+                conn.close()
 
 
-def scrape_pending_meets(workers=8, limit=None):
+def scrape_pending_meets(workers=1, limit=None, sport="xc"):
     conn = get_conn_with_retry()
     try:
         with conn.cursor() as cur:
-            query = "SELECT meet_id, sport, url FROM meets WHERE scraped = FALSE ORDER BY meet_id"
+            query = "SELECT meet_id, url, sport FROM meets WHERE scraped = FALSE"
+            params = []
+            if sport in ("xc", "track"):
+                query += " AND sport = %s"
+                params.append(sport)
+            query += " ORDER BY meet_id"
             if limit:
-                query += f" LIMIT {int(limit)}"
-            cur.execute(query)
+                query += " LIMIT %s"
+                params.append(int(limit))
+            cur.execute(query, params)
             pending = cur.fetchall()
     finally:
         conn.close()
@@ -451,7 +529,7 @@ def scrape_pending_meets(workers=8, limit=None):
     consecutive_blocks = 0
     blocked = False
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(process_meet, mid, sport, url): mid for mid, sport, url in pending}
+        futures = {pool.submit(process_meet, mid, url, s): mid for mid, url, s in pending}
         done = 0
         for future in as_completed(futures):
             meet_id, rows, error, was_blocked = future.result()
@@ -474,12 +552,14 @@ def scrape_pending_meets(workers=8, limit=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape TFRRS meet results into Postgres.")
+    parser = argparse.ArgumentParser(description="Scrape TFRRS cross country and track meet results into Postgres.")
     parser.add_argument("--discover-only", action="store_true", help="Only run meet discovery.")
     parser.add_argument("--scrape-only", action="store_true", help="Only scrape already-discovered meets.")
+    parser.add_argument("--sport", choices=["xc", "track", "both"], default="xc", help="Sport to discover/scrape ('xc', 'track', or 'both'). Default: xc")
     parser.add_argument("--start-page", type=int, default=1)
     parser.add_argument("--end-page", type=int, default=None)
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--since-year", type=int, default=None, help="Skip meets before this year; stop discovery once results are mostly older.")
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--limit", type=int, default=None, help="Cap number of meets scraped this run.")
     parser.add_argument("--delay", type=float, default=None, help="Seconds to sleep after each HTTP request.")
     args = parser.parse_args()
@@ -492,14 +572,13 @@ def main():
     db.init_schema(conn)
     conn.close()
 
-    session = make_session()
-
     if not args.scrape_only:
-        discover_meets(session, start_page=args.start_page, end_page=args.end_page)
+        with make_session() as session:
+            discover_meets(session, start_page=args.start_page, end_page=args.end_page, since_year=args.since_year, sport=args.sport)
 
     if not args.discover_only:
         try:
-            scrape_pending_meets(workers=args.workers, limit=args.limit)
+            scrape_pending_meets(workers=args.workers, limit=args.limit, sport=args.sport)
         except BlockedError as exc:
             print(f"{exc} Wait a while before retrying, and consider lowering --workers.")
             raise SystemExit(1)
